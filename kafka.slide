@@ -1,0 +1,384 @@
+Kafka for Gophers
+Writing reliabile Go applications with Apache Kafka
+5 Jun 2019
+
+Marsel Mavletkulov
+@marselester
+
+: In order to write reliable Go programs that use Kafka, one should understand what basic Kafka concepts are
+
+* Kafka is a message broker
+
+A message broker is used as follows:
+
+- one process sends a message to a topic (e.g., `wallet.transfer_intent`)
+- broker ensures that the message is delivered to consumers (subsribers of the topic)
+- there can be many producers and consumers on the same topic
+
+A message is an array of bytes, it has no meaning to a message broker
+
+  {
+    "request_id": "0000XSNJG0MQJHBF4QX1EFD6Y3",
+    "from": "Alice",
+    "to": "Bob",
+    "amount": "0.5"
+  }
+
+* Kafka is a log-based message broker
+
+Most brokers delete messages after they were delivered to consumers
+
+Kafka takes the opposite approach and permanently records messages as any database, so Kafka is described as a distributed commit log:
+
+- *log* is a file on disk where messages can only be added at the end
+- *commit*log* in databases is a durable record of all transactions (write-ahead log)
+- append-only files are scattered across many servers for durability
+
+A new consumer can read messages written arbitrary far in the past
+
+* Scalability and redundancy
+
+Partitioning is splitting up a large dataset that is too big for a single machine
+
+*Topic* is broken down into partitions, e.g., `wallet.payment` topic might have 100 partitions (log files)
+
+Replication is keeping a copy of the same data on several nodes so that it remains accessible when a node becomes unreachable
+
+*Replica* is a copy of a partition, usually a partition has 3 or 5 replicas
+
+: Broker is a machine where partitions are stored
+
+* Kafka guarantees
+
+Messages in a partition are ordered
+
+Consumers can only read messages that are committed
+
+Committed messages won't be lost as long as at least one replica remains alive
+
+Message is considered committed when it is written to all in-sync replicas
+
+: Producer can choose to receive acknowledgments
+
+* Replication
+
+All messages are produced to and consumed from the leader replica
+
+  topic - partition 0 (offline)
+        - partition 1 (online)
+        - partition 2 - replica 🗣 (leader)
+                      - replica 🏃‍♀️ (in-sync follower)
+                      - replica 🏃 (in-sync follower)
+                      - replica 🚶 (in-sync follower, but slightly behind)
+                      - replica 😵 (out-of-sync follower)
+
+If the leader becomes unavailable, one of the in-sync followers becomes the new leader
+
+In-sync follower:
+
+- connected to Zookeeper (sends a heartbeat to Zookeeper)
+- has almost no lag (fetched the most recent messages from the leader)
+
+Slow in-sync followers slow down producers and consumers (wait for commit ack)
+
+: They wait for all the in-sync replicas to get the message before it is committed
+
+* Broker
+
+*unclean.leader.election.enable=false* — wait for the original leader to come back online to prevent loss of committed messages [[https://github.com/apache/kafka/pull/2625][#2625]]
+
+*min.insync.replicas=1*
+
+- two replicas are out-of-sync (brokers crashed or fell behind due to network glitch)
+- one in-sync replica (leader) accepts writes
+- if it crashes too, the out-of-sync replicas won't catch up
+
+*min.insync.replicas=2*
+
+- can write to a partition if >= 2 replicas are in-sync, otherwise broker rejects writes
+- consumers still can read from the remaining in-sync replica
+
+* Producer
+
+*acks=1*
+
+- message was written to the leader, producer thinks it was written successfully
+- the leader crashes, in-sync replicas have not received the message yet
+- new leader is elected, the message is lost
+
+Leader should wait until *all*in-sync*replicas* got the message before sending ack/error
+
+*acks=all*
+
+- message wasn't written to the leader, because it crashed
+- producer didn't handle "Leader not available" error, the message is lost
+
+Producer should *auto*retry* if error is related to leader election or network issues
+
+* Message is stored at least once
+
+Message was committed, but the ack wasn't received by producer due to network issue
+
+: Bug in app can also cause message duplicates, or you had to replay older messages
+
+Producer sends the message again leading to duplicates
+
+Solution:
+
+- your customer should pass a unique identifier, e.g., in `X-Request-ID` header
+- Kafka consumer shall deduplicate messages by `request_id`
+- the processed IDs should be stored somewhere, e.g., in RocksDB ([[https://github.com/marselester/distributed-payment][example]])
+- derived messages in `wallet.payment` topic should also include `request_id`
+
+  {
+    "request_id": "0000XSNJG0MQJHBF4QX1EFD6Y3",
+    "account": "Alice",
+    "direction": "outgoing",
+    "amount": "0.5"
+  }
+
+* Producer's errors
+
+Nonretriable errors:
+
+- message size is too large
+- authorization errors
+- serialization errors (Apache Avro, Protobuf)
+- exhausted retry attempts
+- out of memory
+
+: When accuracy must be 100% (data must be accurate and can't be lost)
+
+Recovery options:
+
+- crash the app and start over
+- write the message into another topic for investigation
+
+* kafka-go
+
+[[https://github.com/segmentio/kafka-go]]:
+
+- well-documented
+- sane defaults, tuned for reliability
+- low and high level APIs for interacting with Kafka
+
+.image img/kafka.png 150 _
+.image img/gopher.png 150 _
+
+* kafka-go: producer
+
+By default [[https://godoc.org/github.com/segmentio/kafka-go#WriterConfig][kafka-go producer]]:
+
+- synchronously sends messages to report whether error occurred, `Async=false`
+- waits for all replicas to return acknowledgments, `RequiredAcks=-1`
+- auto retries ten times when error is transient, `MaxAttempts=10`
+
+: MaxAttempts should cover at least a few seconds of retries to wait for network issue to resolve
+: Should be at least two broker addresses in case one of them is down
+
+    producer := kafka.NewWriter(kafka.WriterConfig{
+        Brokers: []string{"127.0.0.1:9092", "127.0.0.2:9092"},
+        Topic:   "wallet.transfer_intent",
+    })
+    defer producer.Close()
+
+    m := kafka.Message{Key: []byte("..."), Value: []byte("...")}
+    if err := producer.WriteMessages(ctx, m); err != nil {
+        log.Fatalf("nonretriable error: %v", err)
+    }
+
+* kafka-go: message routing
+
+It's easier to deduplicate a message when it's always routed to the same partition
+
+Messages with the same *key* are routed to the same partition
+
+If you partition messages by `request_id`, all requests with the same ID will be stored in the same Kafka partition based on [[http://medium.com/@dgryski/consistent-hashing-algorithmic-tradeoffs-ef6b8e2fcae8][consistent hashing algorithm]]
+
+    producer := kafka.NewWriter(kafka.WriterConfig{
+        Brokers:  []string{"127.0.0.1:9092", "127.0.0.2:9092"},
+        Topic:    "wallet.transfer_intent",
+        Balancer: &kafka.Hash{},
+    })
+    defer producer.Close()
+
+    m := kafka.Message{
+        Key:   []byte("0000XSNJG0MQJHBF4QX1EFD6Y3"),
+        Value: []byte(`{"request_id": "0000XSN...", "from": "...", "to": "...", "amount": "..."}`),
+    }
+
+: Create topics with sufficient partitions upfront so keys mapping stays consistent
+
+* kafka-go: writing in batches
+
+If it takes 10ms to write a single message to Kafka, sending 100 will take 1s
+
+When each batch contains 100 messages, sending 10K messages will take 1s
+
+  err := producer.WriteMessages(ctx, msgs...) // msgs contains 100 messages.
+
+Depending on your Service Level Objective, choose acceptable latency vs throughput
+
+By default kafka-go:
+
+- buffers 100 messages before sending to Kafka, `BatchSize=100`
+- flushes an incomplete message batch every second, `BatchTimeout=time.Second`
+- guarantees the order of messages in a partition isn't lost due to batch retries [[https://github.com/segmentio/kafka-go/issues/278][#278]]
+
+: Each partition has a separate writer
+: Each partition writer forms its own batch and will be trying to send the same batch again and again until it succeeds
+: In Java client the setting should be "in.flight.requests.per.session=1"
+
+* Consumer
+
+Keep track of messages (offset in partition) consumer has processed to know where to continue when app crashes
+
+: Consumer fetches messages from a partition in batches
+: It checks the last offset in the batch, then requests another batch starting from it
+
+*Missed*messages* (committed > processed)
+
+- consumer autocommitted the offset by timer, but didn't process the messages
+
+*Double*processing* (committed < processed):
+
+- consumer processed the messages, but didn't autocommit the offset by timer
+- message was processed, but async commit failed
+- async commit overwrote offset after retry: commit *A* failed → commit *B* → commit *A*
+
+: `__consumer_offsets` topic is blank, starting from the beginning
+
+* kafka-go: consumer group
+
+By default [[https://godoc.org/github.com/segmentio/kafka-go#ReaderConfig][kafka-go consumer]]:
+
+- disables periodic automatic offset commit, `CommitInterval=0`
+- is responsive: reader waits for 100ms/1s before polling for new messages, `ReadBackoffMin/ReadBackoffMax`
+
+: In Java batch=pool(100ms) will block for 100ms if data is not available in the consumer buffer
+: It returns in 100ms with or without data
+: Choose acceptable timeout interval depending on how fast the app should be unblocked from polling depending on your Service Level Objective
+
+`ReadMessage()` returns one message with synchronous offset commit
+
+    consumer := kafka.NewReader(kafka.ReaderConfig{
+        Brokers: []string{"127.0.0.1:9092", "127.0.0.2:9092"},
+        GroupID: "paymentd",
+        Topic:   "wallet.transfer_intent",
+    })
+    defer consumer.Close()
+
+    m, err := r.ReadMessage(ctx)
+    if err != nil {
+        log.Fatalf("read failed: %v", err)
+    }
+
+* kafka-go: reading in batches
+
+If you want to go faster, read in batches and commit offsets once
+
+`FetchMessage()` returns one message without commiting it
+
+`CommitMessages()` commits the offsets
+
+	var batch []kafka.Message
+	var err error
+	for {
+		if batch, err = fetch(ctx, consumer, batch[:0]); err != nil {
+			log.Fatalf("fetch failed: %v", err)
+		}
+
+		for _, m := range batch {
+			fmt.Printf("%s = %s\n", string(m.Key), string(m.Value))
+		}
+
+		if err = consumer.CommitMessages(ctx, batch...); err != nil {
+			log.Fatalf("offset commit failed: %v", err)
+		}
+	}
+
+* kafka-go: fetch a batch of messages
+
+: When there are no messages from the broker/in the buffer, it will unblock the underlying FetchMessage
+: every ReadBackoffMin interval to see if it can return the existing batch
+
+: ReadBackoffMin=100ms is the smallest amount of time the reader will wait before polling for new messages
+
+: When a batch has reached the length of the QueueCapacity=100, the batch is returned
+
+    func fetch(ctx context.Context, r *kafka.Reader, batch []kafka.Message) ([]kafka.Message, error) {
+        cfg := r.Config()
+        for {
+            ctx, cancel := context.WithTimeout(ctx, cfg.ReadBackoffMin)
+            m, err := r.FetchMessage(ctx)
+            cancel()
+
+            switch err {
+            case nil:
+                batch = append(batch, m)
+                if len(batch) >= cfg.QueueCapacity {
+                    return batch, nil
+                }
+            case ctx.Err():
+                if len(batch) > 0 {
+                    return batch, nil
+                }
+            default:
+                return batch, err
+            }
+        }
+    }
+
+* Message processing
+
+Records derived from messages are usually stored in a database, e.g., PostgreSQL
+
+Since offsets are stored in Kafka, a database will see duplicates:
+
+- message was processed (record was updated in Postgres)
+- app crashed, offset was not committed in Kafka
+
+Atomically save the offset in a database along with the record
+
+    BEGIN
+    UPDATE transfer_intent SET ...;
+    UPDATE consumer_offset SET offset=100500 WHERE topic='wallet.transfer_intent', partition=0;
+    COMMIT
+
+* Semantic deduplication
+
+Customer accidentally clicked "send $100" button ten times
+
+    POST /v1/transfers HTTP/1.1
+    X-Request-ID: 0000XSNJG0MQJHBF4QX1EFD6Y3
+
+Note, request ID is generated on client side (in browser)
+
+- [[https://github.com/oklog/ulid][Universally Unique Lexicographically Sortable Identifier]]
+- [[https://github.com/segmentio/ksuid][K-Sortable Unique IDentifier]]
+
+Make sure the customer's $100 transfer has been processed only once
+
+    BEGIN
+    INSERT INTO transfer_intent (request_id, from, to, amount) values (...);
+    UPDATE account SET balance =- 100 WHERE id = ...;
+    COMMIT
+
+Request ID is passed in derived messages, so "funds deducted" email is sent once
+
+* Conclusion
+
+Keys for reliable data delivery:
+
+- 3 or 5 replicas for durability (increase hardware costs)
+- >= 2 in-sync replicas (prefer the system to be unavailable to consistently store messages)
+- wait for acknowledgments (give up highest throughput and lowest latency)
+- design your services with semantic deduplication in mind
+
+Use message batching for higher throughput
+
+* References
+
+- [[https://www.confluent.io/resources/kafka-the-definitive-guide/][Kafka: The Definitive Guide]] Neha Narkhede, Gwen Shapira, and Todd Palino
+- [[https://dataintensive.net/][Designing Data-Intensive Applications]] Martin Kleppmann
+- [[https://github.com/segmentio/kafka-go]]
