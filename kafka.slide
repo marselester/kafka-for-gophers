@@ -268,7 +268,7 @@ By default [[https://godoc.org/github.com/segmentio/kafka-go#ReaderConfig][kafka
     })
     defer consumer.Close()
 
-    m, err := r.ReadMessage(ctx)
+    m, err := consumer.ReadMessage(ctx)
     if err != nil {
         log.Fatalf("read failed: %v", err)
     }
